@@ -75,11 +75,11 @@ BPM_HISTORY_LENGTH = 10  # Number of IOIs to keep for BPM calculation
 MIN_BPM = 30
 MAX_BPM = 300
 DEFAULT_ANALYSIS_WINDOW = 10.0  # Seconds of envelope history for rhythm analysis
-ENVELOPE_SAMPLE_RATE = 100  # Hz - sample rate for envelope (100 samples/sec)
+ENVELOPE_SAMPLE_RATE = 200  # Hz - sample rate for envelope (200 samples/sec for higher resolution)
 DEFAULT_RHYTHM_FREQ_MIN = 0.5  # Hz (30 BPM)
 DEFAULT_RHYTHM_FREQ_MAX = 5.0  # Hz (300 BPM)
 DEFAULT_MAGNITUDE_MIN = 0.0  # Y-axis min for rhythm spectrum
-DEFAULT_MAGNITUDE_MAX = 1.0  # Y-axis max for rhythm spectrum
+DEFAULT_MAGNITUDE_MAX = 0.05  # Y-axis max for rhythm spectrum
 BPM_RESET_TIMEOUT = 2.0  # Seconds without onset before resetting BPM display
 
 
@@ -148,7 +148,7 @@ def compute_rhythm_spectrum(envelope_samples, sample_rate):
     
     Args:
         envelope_samples: Array of energy envelope values sampled at sample_rate
-        sample_rate: Sample rate of the envelope (e.g., 100 Hz)
+        sample_rate: Sample rate of the envelope (e.g., 200 Hz)
     
     Returns:
         frequencies: Rhythm frequencies in Hz (1 Hz = 60 BPM)
@@ -165,15 +165,18 @@ def compute_rhythm_spectrum(envelope_samples, sample_rate):
     window = np.hanning(n_samples)
     windowed = envelope * window
     
-    # Compute FFT
-    fft_result = np.fft.rfft(windowed)
+    # Zero-pad for higher frequency resolution (4x padding)
+    n_fft = n_samples * 4
+    
+    # Compute FFT with zero-padding
+    fft_result = np.fft.rfft(windowed, n=n_fft)
     magnitude = np.abs(fft_result)
     
     # Normalize magnitude
     magnitude = magnitude / (n_samples / 2)
     
     # Frequency axis (rhythm frequency in Hz)
-    frequencies = np.fft.rfftfreq(n_samples, 1.0 / sample_rate)
+    frequencies = np.fft.rfftfreq(n_fft, 1.0 / sample_rate)
     
     return frequencies, magnitude
 
@@ -681,6 +684,7 @@ class DrumBPMWindow(QMainWindow):
         self.waveform_plot.setLabel('bottom', 'Time', 's')
         self.waveform_plot.setYRange(-1, 1)
         self.waveform_plot.setBackground('#1e1e1e')
+        self.waveform_plot.showGrid(x=True, y=True, alpha=0.3)
         self.waveform_curve = self.waveform_plot.plot(pen=pg.mkPen('#4CAF50', width=1))
         waveform_layout.addWidget(self.waveform_plot)
         
@@ -745,6 +749,9 @@ class DrumBPMWindow(QMainWindow):
         self.spectrum_plot.setXRange(DEFAULT_RHYTHM_FREQ_MIN, DEFAULT_RHYTHM_FREQ_MAX)
         self.spectrum_plot.setYRange(0, 1)
         self.spectrum_plot.setBackground('#1e1e1e')
+        self.spectrum_plot.showGrid(x=True, y=True, alpha=0.3)
+        # Set higher resolution x-axis ticks (every 0.1 Hz)
+        self.spectrum_plot.getAxis('bottom').setTickSpacing(major=0.5, minor=0.1)
         self.spectrum_curve = self.spectrum_plot.plot(pen=pg.mkPen('#FF9800', width=2))
         spectrum_layout.addWidget(self.spectrum_plot)
         
