@@ -78,6 +78,9 @@ DEFAULT_ANALYSIS_WINDOW = 10.0  # Seconds of envelope history for rhythm analysi
 ENVELOPE_SAMPLE_RATE = 100  # Hz - sample rate for envelope (100 samples/sec)
 DEFAULT_RHYTHM_FREQ_MIN = 0.5  # Hz (30 BPM)
 DEFAULT_RHYTHM_FREQ_MAX = 5.0  # Hz (300 BPM)
+DEFAULT_MAGNITUDE_MIN = 0.0  # Y-axis min for rhythm spectrum
+DEFAULT_MAGNITUDE_MAX = 1.0  # Y-axis max for rhythm spectrum
+BPM_RESET_TIMEOUT = 2.0  # Seconds without onset before resetting BPM display
 
 
 # -----------------------------------------------------------------------------
@@ -224,6 +227,7 @@ class AudioProcessor:
         self.current_bpm = 0.0
         self.current_bpm_lock = Lock()
         self.last_onset_detected = False
+        self.last_onset_time = 0.0  # Timestamp of last onset
         
         # Stream control
         self.stream = None
@@ -314,6 +318,7 @@ class AudioProcessor:
                 current_time = time.time()
                 self.onset_times.append(current_time)
                 self.last_onset_sample = self.total_samples_processed
+                self.last_onset_time = current_time
                 
                 # Record for export
                 self.onset_timestamps.append(current_time)
@@ -646,6 +651,19 @@ class DrumBPMWindow(QMainWindow):
         self.bpm_unit_label.setFont(unit_font)
         bpm_layout.addWidget(self.bpm_unit_label)
         
+        # Hz display
+        self.hz_label = QLabel("---")
+        self.hz_label.setAlignment(Qt.AlignCenter)
+        hz_font = QFont("Arial", 36, QFont.Bold)
+        self.hz_label.setFont(hz_font)
+        self.hz_label.setStyleSheet("color: #FF9800;")
+        bpm_layout.addWidget(self.hz_label)
+        
+        self.hz_unit_label = QLabel("Hz")
+        self.hz_unit_label.setAlignment(Qt.AlignBottom | Qt.AlignLeft)
+        self.hz_unit_label.setFont(unit_font)
+        bpm_layout.addWidget(self.hz_unit_label)
+        
         # Onset indicator
         self.onset_indicator = QLabel("●")
         self.onset_indicator.setFont(QFont("Arial", 48))
@@ -695,6 +713,28 @@ class DrumBPMWindow(QMainWindow):
         # Show BPM equivalent
         self.bpm_range_label = QLabel(f"({int(DEFAULT_RHYTHM_FREQ_MIN*60)}-{int(DEFAULT_RHYTHM_FREQ_MAX*60)} BPM)")
         range_layout.addWidget(self.bpm_range_label)
+        
+        range_layout.addSpacing(20)
+        
+        # Y-axis range controls
+        range_layout.addWidget(QLabel("Y Min:"))
+        self.ymin_spin = QDoubleSpinBox()
+        self.ymin_spin.setRange(0.0, 10.0)
+        self.ymin_spin.setValue(DEFAULT_MAGNITUDE_MIN)
+        self.ymin_spin.setSingleStep(0.1)
+        self.ymin_spin.setDecimals(2)
+        self.ymin_spin.valueChanged.connect(self._on_yrange_changed)
+        range_layout.addWidget(self.ymin_spin)
+        
+        range_layout.addWidget(QLabel("Y Max:"))
+        self.ymax_spin = QDoubleSpinBox()
+        self.ymax_spin.setRange(0.01, 10.0)
+        self.ymax_spin.setValue(DEFAULT_MAGNITUDE_MAX)
+        self.ymax_spin.setSingleStep(0.1)
+        self.ymax_spin.setDecimals(2)
+        self.ymax_spin.valueChanged.connect(self._on_yrange_changed)
+        range_layout.addWidget(self.ymax_spin)
+        
         range_layout.addStretch()
         
         spectrum_layout.addLayout(range_layout)
@@ -767,6 +807,16 @@ class DrumBPMWindow(QMainWindow):
         # Update BPM equivalent label
         self.bpm_range_label.setText(f"({int(xmin*60)}-{int(xmax*60)} BPM)")
     
+    def _on_yrange_changed(self):
+        """Handle Y-axis range change for rhythm spectrum."""
+        ymin = self.ymin_spin.value()
+        ymax = self.ymax_spin.value()
+        # Ensure min < max
+        if ymin >= ymax:
+            ymax = ymin + 0.1
+            self.ymax_spin.setValue(ymax)
+        self.spectrum_plot.setYRange(ymin, ymax)
+    
     def _toggle_capture(self):
         """Start or stop audio capture."""
         if self.processor and self.processor.running:
@@ -820,12 +870,17 @@ class DrumBPMWindow(QMainWindow):
         if not self.processor or not self.processor.running:
             return
         
-        # Update BPM display
+        # Update BPM display (reset if no onset for timeout period)
         bpm = self.processor.get_current_bpm()
-        if bpm > 0:
+        time_since_onset = time.time() - self.processor.last_onset_time
+        
+        if bpm > 0 and time_since_onset < BPM_RESET_TIMEOUT:
             self.bpm_label.setText(f"{bpm:.1f}")
+            hz = bpm / 60.0
+            self.hz_label.setText(f"{hz:.2f}")
         else:
             self.bpm_label.setText("---")
+            self.hz_label.setText("---")
         
         # Update onset indicator (flash green on hit)
         if self.processor.last_onset_detected:
