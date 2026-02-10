@@ -53,7 +53,7 @@ import sounddevice as sd
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QSlider, QPushButton, QComboBox, QCheckBox, QGroupBox,
-    QFileDialog, QMessageBox, QFrame
+    QFileDialog, QMessageBox, QFrame, QDoubleSpinBox
 )
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QFont
@@ -74,6 +74,10 @@ DEFAULT_HIGHPASS_CUTOFF = 50  # Hz
 BPM_HISTORY_LENGTH = 10  # Number of IOIs to keep for BPM calculation
 MIN_BPM = 30
 MAX_BPM = 300
+DEFAULT_ANALYSIS_WINDOW = 10.0  # Seconds of envelope history for rhythm analysis
+ENVELOPE_SAMPLE_RATE = 100  # Hz - sample rate for envelope (100 samples/sec)
+DEFAULT_RHYTHM_FREQ_MIN = 0.5  # Hz (30 BPM)
+DEFAULT_RHYTHM_FREQ_MAX = 5.0  # Hz (300 BPM)
 
 
 # -----------------------------------------------------------------------------
@@ -134,6 +138,43 @@ def compute_spectrum(signal, fs, window_size=2048):
     return frequencies, magnitude_db
 
 
+def compute_rhythm_spectrum(envelope_samples, sample_rate):
+    """
+    Compute rhythm frequency spectrum from energy envelope.
+    Returns frequencies (in Hz, i.e., hits per second) and magnitude.
+    
+    Args:
+        envelope_samples: Array of energy envelope values sampled at sample_rate
+        sample_rate: Sample rate of the envelope (e.g., 100 Hz)
+    
+    Returns:
+        frequencies: Rhythm frequencies in Hz (1 Hz = 60 BPM)
+        magnitude: Magnitude (normalized)
+    """
+    n_samples = len(envelope_samples)
+    if n_samples < 4:
+        return np.array([]), np.array([])
+    
+    # Remove DC component (mean)
+    envelope = envelope_samples - np.mean(envelope_samples)
+    
+    # Apply Hann window
+    window = np.hanning(n_samples)
+    windowed = envelope * window
+    
+    # Compute FFT
+    fft_result = np.fft.rfft(windowed)
+    magnitude = np.abs(fft_result)
+    
+    # Normalize magnitude
+    magnitude = magnitude / (n_samples / 2)
+    
+    # Frequency axis (rhythm frequency in Hz)
+    frequencies = np.fft.rfftfreq(n_samples, 1.0 / sample_rate)
+    
+    return frequencies, magnitude
+
+
 # -----------------------------------------------------------------------------
 # AUDIO PROCESSOR CLASS
 # -----------------------------------------------------------------------------
@@ -171,6 +212,13 @@ class AudioProcessor:
         
         # Energy envelope history for adaptive threshold
         self.energy_history = deque(maxlen=int(sample_rate * 0.5))  # 500ms of history
+        
+        # Rhythm analysis buffer (stores energy envelope samples over time)
+        self.analysis_window = DEFAULT_ANALYSIS_WINDOW
+        max_envelope_samples = int(DEFAULT_ANALYSIS_WINDOW * ENVELOPE_SAMPLE_RATE * 1.5)  # Extra buffer
+        self._envelope_buffer = deque(maxlen=max_envelope_samples)
+        self._envelope_lock = Lock()
+        self._last_envelope_time = 0
         
         # Current state (thread-safe access)
         self.current_bpm = 0.0
@@ -273,6 +321,9 @@ class AudioProcessor:
                 # Compute BPM from IOIs
                 self._update_bpm()
             
+            # Update envelope sample for rhythm analysis
+            self.update_envelope_sample()
+            
             self.total_samples_processed += len(chunk) // 2
             time.sleep(0.005)
     
@@ -328,13 +379,58 @@ class AudioProcessor:
                 data = np.array(list(self.audio_buffer)[-samples:])
         return data
     
-    def get_spectrum_data(self):
-        """Get current frequency spectrum."""
+    def set_analysis_window(self, seconds):
+        """Set the rhythm analysis window duration."""
+        self.analysis_window = seconds
+        # Resize buffer if needed
+        max_samples = int(seconds * ENVELOPE_SAMPLE_RATE * 1.5)
+        with self._envelope_lock:
+            self._envelope_buffer = deque(self._envelope_buffer, maxlen=max_samples)
+    
+    def update_envelope_sample(self):
+        """
+        Sample current energy envelope and add to history.
+        Called periodically from processing thread.
+        """
+        current_time = time.time()
+        sample_interval = 1.0 / ENVELOPE_SAMPLE_RATE
+        if current_time - self._last_envelope_time < sample_interval:
+            return
+        
         with self.buffer_lock:
-            if len(self.audio_buffer) < 2048:
+            if len(self.audio_buffer) < 512:
+                return
+            # Get recent audio for envelope calculation
+            data = np.array(list(self.audio_buffer)[-1024:])
+        
+        # Compute current energy (RMS)
+        energy = np.sqrt(np.mean(data ** 2))
+        
+        with self._envelope_lock:
+            self._envelope_buffer.append((current_time, energy))
+            # Trim old samples outside analysis window
+            cutoff_time = current_time - self.analysis_window
+            while self._envelope_buffer and self._envelope_buffer[0][0] < cutoff_time:
+                self._envelope_buffer.popleft()
+        
+        self._last_envelope_time = current_time
+    
+    def get_spectrum_data(self):
+        """
+        Get rhythm frequency spectrum from energy envelope.
+        Returns frequencies (in Hz, i.e., hits per second) and magnitude.
+        """
+        with self._envelope_lock:
+            if len(self._envelope_buffer) < 10:
                 return np.array([]), np.array([])
-            data = np.array(list(self.audio_buffer)[-4096:])
-        return compute_spectrum(data, self.sample_rate)
+            
+            # Extract just the energy values
+            envelope_samples = np.array([e[1] for e in self._envelope_buffer])
+        
+        # Compute rhythm spectrum
+        freqs, mags = compute_rhythm_spectrum(envelope_samples, ENVELOPE_SAMPLE_RATE)
+        
+        return freqs, mags
     
     def start(self):
         """Start audio capture and processing."""
@@ -388,6 +484,9 @@ class AudioProcessor:
         self.onset_timestamps.clear()
         self.bpm_history.clear()
         self.energy_history.clear()
+        with self._envelope_lock:
+            self._envelope_buffer.clear()
+            self._last_envelope_time = 0
         self.last_onset_sample = -self.refractory_samples
         self.total_samples_processed = 0
         with self.current_bpm_lock:
@@ -503,6 +602,18 @@ class DrumBPMWindow(QMainWindow):
         hp_layout.addWidget(self.hp_checkbox)
         control_layout.addLayout(hp_layout)
         
+        # Analysis window slider
+        analysis_layout = QVBoxLayout()
+        analysis_layout.addWidget(QLabel("Analysis Window (s):"))
+        self.analysis_slider = QSlider(Qt.Horizontal)
+        self.analysis_slider.setRange(2, 30)  # 2 to 30 seconds
+        self.analysis_slider.setValue(int(DEFAULT_ANALYSIS_WINDOW))
+        self.analysis_slider.valueChanged.connect(self._on_analysis_window_changed)
+        analysis_layout.addWidget(self.analysis_slider)
+        self.analysis_label = QLabel(f"{int(DEFAULT_ANALYSIS_WINDOW)} s")
+        analysis_layout.addWidget(self.analysis_label)
+        control_layout.addLayout(analysis_layout)
+        
         # Start/Stop button
         self.start_btn = QPushButton("Start")
         self.start_btn.setMinimumHeight(50)
@@ -557,20 +668,47 @@ class DrumBPMWindow(QMainWindow):
         
         main_layout.addWidget(waveform_group)
         
-        # --- Spectrum Plot ---
-        spectrum_group = QGroupBox("Frequency Spectrum")
-        spectrum_layout = QVBoxLayout(spectrum_group)
+        # --- Rhythm Spectrum Plot ---
+        self.spectrum_group = QGroupBox(f"Rhythm Frequency Analysis (last {int(DEFAULT_ANALYSIS_WINDOW)}s)")
+        spectrum_layout = QVBoxLayout(self.spectrum_group)
+        
+        # X-axis range controls
+        range_layout = QHBoxLayout()
+        range_layout.addWidget(QLabel("X Min (Hz):"))
+        self.xmin_spin = QDoubleSpinBox()
+        self.xmin_spin.setRange(0.1, 10.0)
+        self.xmin_spin.setValue(DEFAULT_RHYTHM_FREQ_MIN)
+        self.xmin_spin.setSingleStep(0.1)
+        self.xmin_spin.setDecimals(1)
+        self.xmin_spin.valueChanged.connect(self._on_xrange_changed)
+        range_layout.addWidget(self.xmin_spin)
+        
+        range_layout.addWidget(QLabel("X Max (Hz):"))
+        self.xmax_spin = QDoubleSpinBox()
+        self.xmax_spin.setRange(0.5, 20.0)
+        self.xmax_spin.setValue(DEFAULT_RHYTHM_FREQ_MAX)
+        self.xmax_spin.setSingleStep(0.5)
+        self.xmax_spin.setDecimals(1)
+        self.xmax_spin.valueChanged.connect(self._on_xrange_changed)
+        range_layout.addWidget(self.xmax_spin)
+        
+        # Show BPM equivalent
+        self.bpm_range_label = QLabel(f"({int(DEFAULT_RHYTHM_FREQ_MIN*60)}-{int(DEFAULT_RHYTHM_FREQ_MAX*60)} BPM)")
+        range_layout.addWidget(self.bpm_range_label)
+        range_layout.addStretch()
+        
+        spectrum_layout.addLayout(range_layout)
         
         self.spectrum_plot = pg.PlotWidget()
-        self.spectrum_plot.setLabel('left', 'Magnitude', 'dB')
-        self.spectrum_plot.setLabel('bottom', 'Frequency', 'Hz')
-        self.spectrum_plot.setXRange(0, 8000)
-        self.spectrum_plot.setYRange(-60, 0)
+        self.spectrum_plot.setLabel('left', 'Magnitude')
+        self.spectrum_plot.setLabel('bottom', 'Rhythm Frequency (Hz) [1 Hz = 60 BPM]')
+        self.spectrum_plot.setXRange(DEFAULT_RHYTHM_FREQ_MIN, DEFAULT_RHYTHM_FREQ_MAX)
+        self.spectrum_plot.setYRange(0, 1)
         self.spectrum_plot.setBackground('#1e1e1e')
-        self.spectrum_curve = self.spectrum_plot.plot(pen=pg.mkPen('#FF9800', width=1))
+        self.spectrum_curve = self.spectrum_plot.plot(pen=pg.mkPen('#FF9800', width=2))
         spectrum_layout.addWidget(self.spectrum_plot)
         
-        main_layout.addWidget(spectrum_group)
+        main_layout.addWidget(self.spectrum_group)
         
         # --- Status Bar ---
         self.statusBar().showMessage("Ready - Select device and click Start")
@@ -610,6 +748,25 @@ class DrumBPMWindow(QMainWindow):
         if self.processor:
             self.processor.set_highpass_enabled(state == Qt.Checked)
     
+    def _on_analysis_window_changed(self, value):
+        """Handle analysis window slider change."""
+        self.analysis_label.setText(f"{value} s")
+        self.spectrum_group.setTitle(f"Rhythm Frequency Analysis (last {value}s)")
+        if self.processor:
+            self.processor.set_analysis_window(value)
+    
+    def _on_xrange_changed(self):
+        """Handle X-axis range change for rhythm spectrum."""
+        xmin = self.xmin_spin.value()
+        xmax = self.xmax_spin.value()
+        # Ensure min < max
+        if xmin >= xmax:
+            xmax = xmin + 0.5
+            self.xmax_spin.setValue(xmax)
+        self.spectrum_plot.setXRange(xmin, xmax)
+        # Update BPM equivalent label
+        self.bpm_range_label.setText(f"({int(xmin*60)}-{int(xmax*60)} BPM)")
+    
     def _toggle_capture(self):
         """Start or stop audio capture."""
         if self.processor and self.processor.running:
@@ -627,6 +784,7 @@ class DrumBPMWindow(QMainWindow):
             self.processor.set_sensitivity(self.sens_slider.value() / 10.0)
             self.processor.set_refractory_ms(self.refr_slider.value())
             self.processor.set_highpass_enabled(self.hp_checkbox.isChecked())
+            self.processor.set_analysis_window(self.analysis_slider.value())
             
             self.processor.start()
             self.current_sample_rate = sample_rate
