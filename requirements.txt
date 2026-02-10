@@ -1,0 +1,14 @@
+# Drum BPM Timing Trainer - Dependencies
+
+# Audio I/O
+sounddevice>=0.4.6
+
+# Numerics and signal processing
+numpy>=1.24.0
+scipy>=1.10.0
+
+# GUI framework
+PySide6>=6.5.0
+
+# Fast real-time plotting
+pyqtgraph>=0.13.0
