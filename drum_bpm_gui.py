@@ -84,6 +84,7 @@ BPM_RESET_TIMEOUT = 2.0  # Seconds without onset before resetting BPM display
 YAXIS_SMOOTH_FACTOR = 0.05  # Exponential smoothing for dynamic Y-axis (lower = smoother)
 CONSISTENCY_RESOLUTION = 200  # Number of bins for consistency heatmap
 CONSISTENCY_SIGMA_RANGE = 4  # How many std devs to show around mean
+DEFAULT_TIMELINE_WINDOW = 30  # Seconds of Hz timeline to show
 
 
 # -----------------------------------------------------------------------------
@@ -458,6 +459,30 @@ class AudioProcessor:
         
         return float(np.mean(hz_values)), float(np.std(hz_values)), hz_values
     
+    def get_hz_timeline(self, window_seconds):
+        """
+        Get timestamped Hz values for the timeline plot.
+        Returns (relative_times, hz_values) where relative_times are seconds ago (negative).
+        """
+        with self._rhythm_lock:
+            if len(self._rhythm_onset_times) < 3:
+                return np.array([]), np.array([])
+            times = list(self._rhythm_onset_times)
+        
+        now = time.time()
+        cutoff = now - window_seconds
+        
+        # Compute Hz between consecutive onsets
+        rel_times = []
+        hz_vals = []
+        for i in range(1, len(times)):
+            ioi = times[i] - times[i - 1]
+            if ioi > 0 and times[i] >= cutoff:
+                rel_times.append(times[i] - now)  # Negative values (seconds ago)
+                hz_vals.append(1.0 / ioi)
+        
+        return np.array(rel_times), np.array(hz_vals)
+    
     def start(self):
         """Start audio capture and processing."""
         if self.running:
@@ -570,6 +595,9 @@ class DrumBPMWindow(QMainWindow):
         
         # Smoothed Y-axis max for dynamic scaling
         self._smooth_ymax = DEFAULT_MAGNITUDE_MAX
+        self._smooth_timeline_ymin = 0.0
+        self._smooth_timeline_ymax = 3.0
+        self._timeline_window = DEFAULT_TIMELINE_WINDOW
     
     def _build_ui(self):
         """Build the user interface."""
@@ -805,9 +833,8 @@ class DrumBPMWindow(QMainWindow):
         self.consistency_plot.showGrid(x=True, alpha=0.3)
         self.consistency_plot.getAxis('bottom').setTickSpacing(major=0.5, minor=0.1)
         
-        # Create image item for heatmap
-        self.consistency_img = pg.ImageItem()
-        self.consistency_plot.addItem(self.consistency_img)
+        # Use BarGraphItem for colored heatmap bars
+        self.consistency_bars = None  # Will be created on first update
         
         # Mean marker line
         self.mean_line = pg.InfiniteLine(angle=90, pen=pg.mkPen('#FFFFFF', width=2, style=Qt.DashLine))
@@ -824,6 +851,37 @@ class DrumBPMWindow(QMainWindow):
         consistency_layout.addWidget(self.consistency_info)
         
         main_layout.addWidget(consistency_group)
+        
+        # --- Hz Timeline Plot ---
+        timeline_group = QGroupBox("Hit Frequency Timeline")
+        timeline_layout = QVBoxLayout(timeline_group)
+        
+        # Timeline window control
+        timeline_ctrl = QHBoxLayout()
+        timeline_ctrl.addWidget(QLabel("Show last:"))
+        self.timeline_slider = QSlider(Qt.Horizontal)
+        self.timeline_slider.setRange(5, 120)
+        self.timeline_slider.setValue(DEFAULT_TIMELINE_WINDOW)
+        self.timeline_slider.valueChanged.connect(self._on_timeline_window_changed)
+        timeline_ctrl.addWidget(self.timeline_slider)
+        self.timeline_window_label = QLabel(f"{DEFAULT_TIMELINE_WINDOW} s")
+        timeline_ctrl.addWidget(self.timeline_window_label)
+        timeline_ctrl.addStretch()
+        timeline_layout.addLayout(timeline_ctrl)
+        
+        self.timeline_plot = pg.PlotWidget()
+        self.timeline_plot.setLabel('left', 'Frequency', 'Hz')
+        self.timeline_plot.setLabel('bottom', 'Time', 's')
+        self.timeline_plot.setBackground('#1e1e1e')
+        self.timeline_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.timeline_plot.setXRange(-DEFAULT_TIMELINE_WINDOW, 0)
+        self.timeline_curve = self.timeline_plot.plot(
+            pen=pg.mkPen('#2196F3', width=2),
+            symbol='o', symbolSize=6, symbolBrush='#2196F3'
+        )
+        timeline_layout.addWidget(self.timeline_plot)
+        
+        main_layout.addWidget(timeline_group)
         
         # --- Status Bar ---
         self.statusBar().showMessage("Ready - Select device and click Start")
@@ -902,6 +960,12 @@ class DrumBPMWindow(QMainWindow):
         if not auto:
             # Apply current spin values when switching to manual
             self._on_yrange_changed()
+    
+    def _on_timeline_window_changed(self, value):
+        """Handle timeline window slider change."""
+        self._timeline_window = value
+        self.timeline_window_label.setText(f"{value} s")
+        self.timeline_plot.setXRange(-value, 0)
     
     def _toggle_capture(self):
         """Start or stop audio capture."""
@@ -1037,26 +1101,27 @@ class DrumBPMWindow(QMainWindow):
             x_start = mean_hz - display_range
             x_end = mean_hz + display_range
             x = np.linspace(x_start, x_end, CONSISTENCY_RESOLUTION)
+            bar_width = (x_end - x_start) / CONSISTENCY_RESOLUTION
             
             # Compute normal distribution
             gauss = np.exp(-0.5 * ((x - mean_hz) / std_hz) ** 2)
             
-            # Build color image: green (consistent) to red (low density)
-            # Shape: (width, height=1, RGBA)
-            img = np.zeros((CONSISTENCY_RESOLUTION, 1, 4), dtype=np.ubyte)
-            for i in range(CONSISTENCY_RESOLUTION):
-                g = gauss[i]
-                # Green channel high when g is high, red when g is low
+            # Build per-bar brushes: green (consistent) to red (low density)
+            brushes = []
+            for g in gauss:
                 r = int(255 * (1.0 - g))
                 green = int(255 * g)
-                img[i, 0] = [r, green, 0, 220]
+                brushes.append(pg.mkBrush(r, green, 0, 220))
             
-            self.consistency_img.setImage(img, autoLevels=False)
-            # Map image coordinates to data coordinates
-            scale_x = (x_end - x_start) / CONSISTENCY_RESOLUTION
-            self.consistency_img.setTransform(
-                pg.QtGui.QTransform().translate(x_start, 0).scale(scale_x, 1)
+            # Remove old bars if present
+            if self.consistency_bars is not None:
+                self.consistency_plot.removeItem(self.consistency_bars)
+            
+            self.consistency_bars = pg.BarGraphItem(
+                x=x, height=np.ones(CONSISTENCY_RESOLUTION), width=bar_width,
+                brushes=brushes, pen=None
             )
+            self.consistency_plot.addItem(self.consistency_bars)
             self.consistency_plot.setXRange(x_start, x_end)
             self.consistency_plot.setYRange(0, 1)
             
@@ -1075,6 +1140,31 @@ class DrumBPMWindow(QMainWindow):
                 f"CV: {cv:.1f}%  |  "
                 f"Samples: {len(hz_values)}"
             )
+        
+        # Update Hz timeline
+        t_times, t_hz = self.processor.get_hz_timeline(self._timeline_window)
+        if len(t_times) > 0:
+            self.timeline_curve.setData(t_times, t_hz)
+            
+            # Dynamic Y-axis with smoothing
+            current_min = np.min(t_hz)
+            current_max = np.max(t_hz)
+            # Add 10% headroom
+            margin = max((current_max - current_min) * 0.15, 0.1)
+            target_ymin = current_min - margin
+            target_ymax = current_max + margin
+            
+            # Smooth transitions
+            alpha_grow = YAXIS_SMOOTH_FACTOR * 3
+            alpha_shrink = YAXIS_SMOOTH_FACTOR
+            
+            a_min = alpha_shrink if target_ymin > self._smooth_timeline_ymin else alpha_grow
+            self._smooth_timeline_ymin += a_min * (target_ymin - self._smooth_timeline_ymin)
+            
+            a_max = alpha_grow if target_ymax > self._smooth_timeline_ymax else alpha_shrink
+            self._smooth_timeline_ymax += a_max * (target_ymax - self._smooth_timeline_ymax)
+            
+            self.timeline_plot.setYRange(self._smooth_timeline_ymin, self._smooth_timeline_ymax)
     
     def _export_csv(self):
         """Export onset data to CSV."""
