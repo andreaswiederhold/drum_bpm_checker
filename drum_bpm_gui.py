@@ -82,6 +82,8 @@ DEFAULT_MAGNITUDE_MIN = 0.0  # Y-axis min for rhythm spectrum
 DEFAULT_MAGNITUDE_MAX = 0.05  # Y-axis max for rhythm spectrum
 BPM_RESET_TIMEOUT = 2.0  # Seconds without onset before resetting BPM display
 YAXIS_SMOOTH_FACTOR = 0.05  # Exponential smoothing for dynamic Y-axis (lower = smoother)
+CONSISTENCY_RESOLUTION = 200  # Number of bins for consistency heatmap
+CONSISTENCY_SIGMA_RANGE = 4  # How many std devs to show around mean
 
 
 # -----------------------------------------------------------------------------
@@ -429,6 +431,33 @@ class AudioProcessor:
         
         return compute_rhythm_spectrum(onset_times, self.analysis_window)
     
+    def get_rhythm_stats(self):
+        """
+        Get mean and std of hit frequencies (Hz) from recent onset intervals.
+        Returns (mean_hz, std_hz, hz_values) or (None, None, None) if insufficient data.
+        """
+        with self._rhythm_lock:
+            if len(self._rhythm_onset_times) < 3:
+                return None, None, None
+            times = list(self._rhythm_onset_times)
+        
+        # Use onsets within the analysis window
+        now = times[-1]
+        cutoff = now - self.analysis_window
+        recent = [t for t in times if t >= cutoff]
+        
+        if len(recent) < 3:
+            return None, None, None
+        
+        iois = np.diff(recent)
+        # Convert IOIs to Hz (hits per second)
+        hz_values = 1.0 / iois[iois > 0]
+        
+        if len(hz_values) < 2:
+            return None, None, None
+        
+        return float(np.mean(hz_values)), float(np.std(hz_values)), hz_values
+    
     def start(self):
         """Start audio capture and processing."""
         if self.running:
@@ -753,9 +782,48 @@ class DrumBPMWindow(QMainWindow):
         # Set higher resolution x-axis ticks (every 0.1 Hz)
         self.spectrum_plot.getAxis('bottom').setTickSpacing(major=0.5, minor=0.1)
         self.spectrum_curve = self.spectrum_plot.plot(pen=pg.mkPen('#FF9800', width=2))
+        # Peak marker vertical line
+        self.peak_line = pg.InfiniteLine(angle=90, pen=pg.mkPen('#FF5722', width=1.5, style=Qt.DashLine))
+        self.peak_line.setVisible(False)
+        self.spectrum_plot.addItem(self.peak_line)
+        self.peak_label = pg.TextItem(anchor=(0, 1), color='#FF5722')
+        self.spectrum_plot.addItem(self.peak_label)
+        self.peak_label.setVisible(False)
         spectrum_layout.addWidget(self.spectrum_plot)
         
         main_layout.addWidget(self.spectrum_group)
+        
+        # --- Consistency Heatmap Plot ---
+        consistency_group = QGroupBox("Tapping Consistency")
+        consistency_layout = QVBoxLayout(consistency_group)
+        
+        self.consistency_plot = pg.PlotWidget()
+        self.consistency_plot.setLabel('bottom', 'Hit Frequency (Hz)')
+        self.consistency_plot.setBackground('#1e1e1e')
+        self.consistency_plot.setMaximumHeight(120)
+        self.consistency_plot.hideAxis('left')
+        self.consistency_plot.showGrid(x=True, alpha=0.3)
+        self.consistency_plot.getAxis('bottom').setTickSpacing(major=0.5, minor=0.1)
+        
+        # Create image item for heatmap
+        self.consistency_img = pg.ImageItem()
+        self.consistency_plot.addItem(self.consistency_img)
+        
+        # Mean marker line
+        self.mean_line = pg.InfiniteLine(angle=90, pen=pg.mkPen('#FFFFFF', width=2, style=Qt.DashLine))
+        self.mean_line.setVisible(False)
+        self.consistency_plot.addItem(self.mean_line)
+        self.mean_label = pg.TextItem(anchor=(0, 1), color='#FFFFFF')
+        self.mean_label.setVisible(False)
+        self.consistency_plot.addItem(self.mean_label)
+        
+        # Std dev info label
+        self.consistency_info = QLabel("Waiting for taps...")
+        self.consistency_info.setAlignment(Qt.AlignCenter)
+        consistency_layout.addWidget(self.consistency_plot)
+        consistency_layout.addWidget(self.consistency_info)
+        
+        main_layout.addWidget(consistency_group)
         
         # --- Status Bar ---
         self.statusBar().showMessage("Ready - Select device and click Start")
@@ -923,6 +991,24 @@ class DrumBPMWindow(QMainWindow):
         if len(freqs) > 0:
             self.spectrum_curve.setData(freqs, magnitudes)
             
+            # Find and mark peak frequency
+            # Only look at frequencies within the visible X range
+            xmin = self.xmin_spin.value()
+            xmax = self.xmax_spin.value()
+            mask = (freqs >= xmin) & (freqs <= xmax)
+            if np.any(mask):
+                visible_mags = magnitudes[mask]
+                visible_freqs = freqs[mask]
+                peak_idx = np.argmax(visible_mags)
+                peak_freq = visible_freqs[peak_idx]
+                peak_mag = visible_mags[peak_idx]
+                
+                self.peak_line.setValue(peak_freq)
+                self.peak_line.setVisible(True)
+                self.peak_label.setText(f"{peak_freq:.2f} Hz ({peak_freq*60:.0f} BPM)")
+                self.peak_label.setPos(peak_freq, peak_mag)
+                self.peak_label.setVisible(True)
+            
             # Dynamic Y-axis scaling
             if self.auto_y_checkbox.isChecked() and len(magnitudes) > 0:
                 current_max = np.max(magnitudes)
@@ -939,6 +1025,56 @@ class DrumBPMWindow(QMainWindow):
                 self.ymax_spin.blockSignals(True)
                 self.ymax_spin.setValue(self._smooth_ymax)
                 self.ymax_spin.blockSignals(False)
+        
+        # Update consistency heatmap
+        stats = self.processor.get_rhythm_stats()
+        if stats[0] is not None:
+            mean_hz, std_hz, hz_values = stats
+            std_hz = max(std_hz, 0.01)  # Prevent zero std
+            
+            # Build x range centered on mean
+            display_range = max(std_hz * CONSISTENCY_SIGMA_RANGE, 0.5)
+            x_start = mean_hz - display_range
+            x_end = mean_hz + display_range
+            x = np.linspace(x_start, x_end, CONSISTENCY_RESOLUTION)
+            
+            # Compute normal distribution
+            gauss = np.exp(-0.5 * ((x - mean_hz) / std_hz) ** 2)
+            
+            # Build color image: green (consistent) to red (low density)
+            # Shape: (width, height=1, RGBA)
+            img = np.zeros((CONSISTENCY_RESOLUTION, 1, 4), dtype=np.ubyte)
+            for i in range(CONSISTENCY_RESOLUTION):
+                g = gauss[i]
+                # Green channel high when g is high, red when g is low
+                r = int(255 * (1.0 - g))
+                green = int(255 * g)
+                img[i, 0] = [r, green, 0, 220]
+            
+            self.consistency_img.setImage(img, autoLevels=False)
+            # Map image coordinates to data coordinates
+            scale_x = (x_end - x_start) / CONSISTENCY_RESOLUTION
+            self.consistency_img.setTransform(
+                pg.QtGui.QTransform().translate(x_start, 0).scale(scale_x, 1)
+            )
+            self.consistency_plot.setXRange(x_start, x_end)
+            self.consistency_plot.setYRange(0, 1)
+            
+            # Mean marker
+            self.mean_line.setValue(mean_hz)
+            self.mean_line.setVisible(True)
+            self.mean_label.setText(f"μ={mean_hz:.2f} Hz ({mean_hz*60:.0f} BPM)")
+            self.mean_label.setPos(mean_hz, 0.9)
+            self.mean_label.setVisible(True)
+            
+            # Info label
+            cv = (std_hz / mean_hz * 100) if mean_hz > 0 else 0
+            self.consistency_info.setText(
+                f"Mean: {mean_hz:.2f} Hz ({mean_hz*60:.1f} BPM)  |  "
+                f"Std Dev: {std_hz:.3f} Hz ({std_hz*60:.1f} BPM)  |  "
+                f"CV: {cv:.1f}%  |  "
+                f"Samples: {len(hz_values)}"
+            )
     
     def _export_csv(self):
         """Export onset data to CSV."""

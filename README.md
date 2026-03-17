@@ -12,8 +12,16 @@ A real-time drum hit detection and BPM display application for Windows, designed
 - 🥁 **Onset detection** using energy envelope with adaptive threshold
 - 📊 **BPM computation** from inter-onset intervals with outlier rejection (median-based)
 - 📈 **Live waveform display** (last 2 seconds of audio)
-- 🎵 **Live frequency spectrum** (FFT with Hann window)
-- ⚙️ **Adjustable parameters**: sensitivity, refractory period, high-pass filter
+- 🎵 **Rhythm frequency analysis** (FFT of onset impulse train over configurable time window)
+  - Shows peak frequency with labeled dashed marker line
+  - Configurable X/Y axis ranges with BPM equivalents
+  - Auto-scaling Y-axis with smooth transitions
+- 🎯 **Tapping consistency heatmap** - color-coded normal distribution visualization
+  - Green = high density (consistent), Red = low density (inconsistent)
+  - Shows mean, standard deviation, and coefficient of variation
+- 📟 **Hz display** alongside BPM for frequency-based tempo reading
+- ⏰ **Auto-reset** of BPM display after 2 seconds of silence
+- ⚙️ **Adjustable parameters**: sensitivity, refractory period, high-pass filter, analysis window
 - 💾 **CSV export** of onset timestamps and BPM readings
 - 🌙 **Dark theme** UI
 
@@ -21,18 +29,21 @@ A real-time drum hit detection and BPM display application for Windows, designed
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  Controls: [Device ▼] [44100 Hz ▼] [Sens ━━●━] [Start]     │
+│  Controls: [Device ▼] [44100 Hz ▼] [Sens ━━●━]      │
+│  [Min Interval ━●━] [HP ☑] [Analysis 10s] [Start]    │
 ├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│                     127.5  BPM    ●                         │
-│                                                             │
+│            127.5  BPM    2.13  Hz    ●              │
 ├─────────────────────────────────────────────────────────────┤
-│  Waveform                                                   │
-│  ▁▂▃▅█▅▃▂▁▁▁▁▁▁▂▃▅█▅▃▂▁▁▁▁▁▁▂▃▅█▅▃▂▁▁▁▁▁▁             │
+│  Waveform                                           │
+│  ▁▂▃▅█▅▃▂▁▁▁▁▁▁▂▃▅█▅▃▂▁▁▁▁▁▁▂▃▅█▅▃▂▁▁▁▁▁             │
 ├─────────────────────────────────────────────────────────────┤
-│  Spectrum                                                   │
-│  ▅▃▂▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁                                   │
-│  0Hz                                              8000Hz    │
+│  Rhythm Frequency Analysis (last 10s)                │
+│  ▅▃▂▁▁▁▁█▁▁▁▁  ┆ 2.13 Hz (128 BPM)               │
+│  0.5Hz             ┆                      10.0Hz    │
+├─────────────────────────────────────────────────────────────┤
+│  Tapping Consistency                                 │
+│  🟥🟥🟧🟨🟩🟩🟩┃🟩🟩🟩🟨🟧🟥🟥                         │
+│  μ=2.13 Hz (128 BPM) | σ=0.05 Hz | CV: 2.3%         │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -97,8 +108,27 @@ python drum_bpm_gui.py
 | **Sensitivity** | Detection threshold (1.0-10.0). Lower = more sensitive |
 | **Min Interval** | Minimum ms between detected hits (prevents double-triggers) |
 | **High-Pass Filter** | Removes low-frequency rumble (recommended: ON) |
+| **Analysis Window** | Duration (2-30s) of onset history for rhythm frequency analysis |
 | **Start/Stop** | Begin or end audio capture |
 | **Export CSV** | Save onset timestamps and BPM data |
+
+### Rhythm Frequency Analysis (2nd Plot)
+
+| Control | Description |
+|---------|-------------|
+| **X Min/Max (Hz)** | Set visible frequency range (shows BPM equivalents) |
+| **Y Min/Max** | Manual magnitude range (disabled when Auto Y is on) |
+| **Auto Y** | Dynamically scale Y-axis with smooth transitions |
+| **Peak Marker** | Dashed vertical line at peak frequency, labeled with Hz and BPM |
+
+### Tapping Consistency (3rd Plot)
+
+A color-coded heatmap showing how consistent your tapping is:
+- **Green** = high density (you hit close to your mean tempo)
+- **Red** = low density (hits are spread out / inconsistent)
+- **White dashed line** = mean hit frequency (μ)
+- **Info line** = Mean Hz/BPM, Standard Deviation, Coefficient of Variation (CV%), sample count
+- Lower CV% = more consistent timing
 
 ## Calibration Tips
 
@@ -162,6 +192,8 @@ python drum_bpm_gui.py
 4. **Adaptive Threshold**: `mean + k × std` of recent energy history
 5. **Onset Detection**: Energy exceeds threshold with refractory lockout
 6. **BPM Calculation**: Median of inter-onset intervals, IQR outlier rejection
+7. **Rhythm Spectrum**: FFT of onset impulse train over configurable analysis window (2-30s)
+8. **Consistency Analysis**: Normal distribution fitted to inter-onset interval frequencies (Hz), displayed as a green-to-red heatmap
 
 ### Performance
 
