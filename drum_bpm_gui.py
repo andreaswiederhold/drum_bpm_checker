@@ -73,14 +73,15 @@ DEFAULT_REFRACTORY_MS = 100  # Minimum ms between onsets
 DEFAULT_HIGHPASS_CUTOFF = 50  # Hz
 BPM_HISTORY_LENGTH = 10  # Number of IOIs to keep for BPM calculation
 MIN_BPM = 30
-MAX_BPM = 300
-DEFAULT_ANALYSIS_WINDOW = 10.0  # Seconds of envelope history for rhythm analysis
-ENVELOPE_SAMPLE_RATE = 200  # Hz - sample rate for envelope (200 samples/sec for higher resolution)
+MAX_BPM = 600
+DEFAULT_ANALYSIS_WINDOW = 10.0  # Seconds of onset history for rhythm analysis
+IMPULSE_SAMPLE_RATE = 100  # Hz - sample rate for onset impulse train
 DEFAULT_RHYTHM_FREQ_MIN = 0.5  # Hz (30 BPM)
-DEFAULT_RHYTHM_FREQ_MAX = 5.0  # Hz (300 BPM)
+DEFAULT_RHYTHM_FREQ_MAX = 10.0  # Hz (600 BPM)
 DEFAULT_MAGNITUDE_MIN = 0.0  # Y-axis min for rhythm spectrum
 DEFAULT_MAGNITUDE_MAX = 0.05  # Y-axis max for rhythm spectrum
 BPM_RESET_TIMEOUT = 2.0  # Seconds without onset before resetting BPM display
+YAXIS_SMOOTH_FACTOR = 0.05  # Exponential smoothing for dynamic Y-axis (lower = smoother)
 
 
 # -----------------------------------------------------------------------------
@@ -141,41 +142,58 @@ def compute_spectrum(signal, fs, window_size=2048):
     return frequencies, magnitude_db
 
 
-def compute_rhythm_spectrum(envelope_samples, sample_rate):
+def compute_rhythm_spectrum(onset_times, analysis_window, sample_rate=IMPULSE_SAMPLE_RATE):
     """
-    Compute rhythm frequency spectrum from energy envelope.
-    Returns frequencies (in Hz, i.e., hits per second) and magnitude.
+    Compute rhythm frequency spectrum from onset timestamps.
+    Builds an impulse train from detected onsets and computes FFT.
     
     Args:
-        envelope_samples: Array of energy envelope values sampled at sample_rate
-        sample_rate: Sample rate of the envelope (e.g., 200 Hz)
+        onset_times: List of onset timestamps (seconds, absolute)
+        analysis_window: Duration in seconds to analyze
+        sample_rate: Sample rate for the impulse train
     
     Returns:
         frequencies: Rhythm frequencies in Hz (1 Hz = 60 BPM)
         magnitude: Magnitude (normalized)
     """
-    n_samples = len(envelope_samples)
+    if len(onset_times) < 2:
+        return np.array([]), np.array([])
+    
+    now = onset_times[-1]  # Use last onset as reference
+    window_start = now - analysis_window
+    
+    # Build impulse train: 1.0 at onset positions, 0.0 elsewhere
+    n_samples = int(analysis_window * sample_rate)
     if n_samples < 4:
         return np.array([]), np.array([])
     
-    # Remove DC component (mean)
-    envelope = envelope_samples - np.mean(envelope_samples)
+    impulse = np.zeros(n_samples)
+    for t in onset_times:
+        if t >= window_start:
+            idx = int((t - window_start) * sample_rate)
+            if 0 <= idx < n_samples:
+                impulse[idx] = 1.0
+    
+    # Remove DC component
+    impulse = impulse - np.mean(impulse)
     
     # Apply Hann window
     window = np.hanning(n_samples)
-    windowed = envelope * window
+    windowed = impulse * window
     
     # Zero-pad for higher frequency resolution (4x padding)
     n_fft = n_samples * 4
     
-    # Compute FFT with zero-padding
+    # Compute FFT
     fft_result = np.fft.rfft(windowed, n=n_fft)
     magnitude = np.abs(fft_result)
     
-    # Normalize magnitude
-    magnitude = magnitude / (n_samples / 2)
+    # Normalize by number of onsets in window for consistent scale
+    n_onsets = np.sum(impulse > 0.5) + np.sum(impulse < -0.5)  # Count after DC removal
+    if n_onsets > 0:
+        magnitude = magnitude / n_onsets
     
-    # Frequency axis (rhythm frequency in Hz)
+    # Frequency axis
     frequencies = np.fft.rfftfreq(n_fft, 1.0 / sample_rate)
     
     return frequencies, magnitude
@@ -219,12 +237,10 @@ class AudioProcessor:
         # Energy envelope history for adaptive threshold
         self.energy_history = deque(maxlen=int(sample_rate * 0.5))  # 500ms of history
         
-        # Rhythm analysis buffer (stores energy envelope samples over time)
+        # Rhythm analysis
         self.analysis_window = DEFAULT_ANALYSIS_WINDOW
-        max_envelope_samples = int(DEFAULT_ANALYSIS_WINDOW * ENVELOPE_SAMPLE_RATE * 1.5)  # Extra buffer
-        self._envelope_buffer = deque(maxlen=max_envelope_samples)
-        self._envelope_lock = Lock()
-        self._last_envelope_time = 0
+        self._rhythm_onset_times = []  # All onset times for rhythm analysis
+        self._rhythm_lock = Lock()
         
         # Current state (thread-safe access)
         self.current_bpm = 0.0
@@ -326,11 +342,11 @@ class AudioProcessor:
                 # Record for export
                 self.onset_timestamps.append(current_time)
                 
+                # Record for rhythm analysis
+                self._record_rhythm_onset(current_time)
+                
                 # Compute BPM from IOIs
                 self._update_bpm()
-            
-            # Update envelope sample for rhythm analysis
-            self.update_envelope_sample()
             
             self.total_samples_processed += len(chunk) // 2
             time.sleep(0.005)
@@ -390,55 +406,28 @@ class AudioProcessor:
     def set_analysis_window(self, seconds):
         """Set the rhythm analysis window duration."""
         self.analysis_window = seconds
-        # Resize buffer if needed
-        max_samples = int(seconds * ENVELOPE_SAMPLE_RATE * 1.5)
-        with self._envelope_lock:
-            self._envelope_buffer = deque(self._envelope_buffer, maxlen=max_samples)
     
-    def update_envelope_sample(self):
-        """
-        Sample current energy envelope and add to history.
-        Called periodically from processing thread.
-        """
-        current_time = time.time()
-        sample_interval = 1.0 / ENVELOPE_SAMPLE_RATE
-        if current_time - self._last_envelope_time < sample_interval:
-            return
-        
-        with self.buffer_lock:
-            if len(self.audio_buffer) < 512:
-                return
-            # Get recent audio for envelope calculation
-            data = np.array(list(self.audio_buffer)[-1024:])
-        
-        # Compute current energy (RMS)
-        energy = np.sqrt(np.mean(data ** 2))
-        
-        with self._envelope_lock:
-            self._envelope_buffer.append((current_time, energy))
-            # Trim old samples outside analysis window
-            cutoff_time = current_time - self.analysis_window
-            while self._envelope_buffer and self._envelope_buffer[0][0] < cutoff_time:
-                self._envelope_buffer.popleft()
-        
-        self._last_envelope_time = current_time
+    def _record_rhythm_onset(self, onset_time):
+        """Record an onset time for rhythm analysis."""
+        with self._rhythm_lock:
+            self._rhythm_onset_times.append(onset_time)
+            # Trim old onsets outside a generous window (2x analysis for safety)
+            cutoff = onset_time - self.analysis_window * 2
+            self._rhythm_onset_times = [
+                t for t in self._rhythm_onset_times if t >= cutoff
+            ]
     
     def get_spectrum_data(self):
         """
-        Get rhythm frequency spectrum from energy envelope.
+        Get rhythm frequency spectrum from onset impulse train.
         Returns frequencies (in Hz, i.e., hits per second) and magnitude.
         """
-        with self._envelope_lock:
-            if len(self._envelope_buffer) < 10:
+        with self._rhythm_lock:
+            if len(self._rhythm_onset_times) < 2:
                 return np.array([]), np.array([])
-            
-            # Extract just the energy values
-            envelope_samples = np.array([e[1] for e in self._envelope_buffer])
+            onset_times = list(self._rhythm_onset_times)
         
-        # Compute rhythm spectrum
-        freqs, mags = compute_rhythm_spectrum(envelope_samples, ENVELOPE_SAMPLE_RATE)
-        
-        return freqs, mags
+        return compute_rhythm_spectrum(onset_times, self.analysis_window)
     
     def start(self):
         """Start audio capture and processing."""
@@ -492,9 +481,8 @@ class AudioProcessor:
         self.onset_timestamps.clear()
         self.bpm_history.clear()
         self.energy_history.clear()
-        with self._envelope_lock:
-            self._envelope_buffer.clear()
-            self._last_envelope_time = 0
+        with self._rhythm_lock:
+            self._rhythm_onset_times.clear()
         self.last_onset_sample = -self.refractory_samples
         self.total_samples_processed = 0
         with self.current_bpm_lock:
@@ -550,6 +538,9 @@ class DrumBPMWindow(QMainWindow):
         
         # Onset flash state
         self.onset_flash_counter = 0
+        
+        # Smoothed Y-axis max for dynamic scaling
+        self._smooth_ymax = DEFAULT_MAGNITUDE_MAX
     
     def _build_ui(self):
         """Build the user interface."""
@@ -734,10 +725,19 @@ class DrumBPMWindow(QMainWindow):
         self.ymax_spin = QDoubleSpinBox()
         self.ymax_spin.setRange(0.01, 10.0)
         self.ymax_spin.setValue(DEFAULT_MAGNITUDE_MAX)
-        self.ymax_spin.setSingleStep(0.1)
-        self.ymax_spin.setDecimals(2)
+        self.ymax_spin.setSingleStep(0.01)
+        self.ymax_spin.setDecimals(3)
         self.ymax_spin.valueChanged.connect(self._on_yrange_changed)
         range_layout.addWidget(self.ymax_spin)
+        
+        # Auto Y-axis checkbox
+        self.auto_y_checkbox = QCheckBox("Auto Y")
+        self.auto_y_checkbox.setChecked(True)
+        self.auto_y_checkbox.stateChanged.connect(self._on_auto_y_changed)
+        range_layout.addWidget(self.auto_y_checkbox)
+        # Disable manual spinboxes when auto is on
+        self.ymin_spin.setEnabled(False)
+        self.ymax_spin.setEnabled(False)
         
         range_layout.addStretch()
         
@@ -816,6 +816,8 @@ class DrumBPMWindow(QMainWindow):
     
     def _on_yrange_changed(self):
         """Handle Y-axis range change for rhythm spectrum."""
+        if self.auto_y_checkbox.isChecked():
+            return  # Don't apply manual range in auto mode
         ymin = self.ymin_spin.value()
         ymax = self.ymax_spin.value()
         # Ensure min < max
@@ -823,6 +825,15 @@ class DrumBPMWindow(QMainWindow):
             ymax = ymin + 0.1
             self.ymax_spin.setValue(ymax)
         self.spectrum_plot.setYRange(ymin, ymax)
+    
+    def _on_auto_y_changed(self, state):
+        """Handle auto Y-axis toggle."""
+        auto = state == Qt.Checked
+        self.ymin_spin.setEnabled(not auto)
+        self.ymax_spin.setEnabled(not auto)
+        if not auto:
+            # Apply current spin values when switching to manual
+            self._on_yrange_changed()
     
     def _toggle_capture(self):
         """Start or stop audio capture."""
@@ -911,6 +922,23 @@ class DrumBPMWindow(QMainWindow):
         freqs, magnitudes = self.processor.get_spectrum_data()
         if len(freqs) > 0:
             self.spectrum_curve.setData(freqs, magnitudes)
+            
+            # Dynamic Y-axis scaling
+            if self.auto_y_checkbox.isChecked() and len(magnitudes) > 0:
+                current_max = np.max(magnitudes)
+                # Add 20% headroom
+                target_ymax = max(current_max * 1.2, 0.001)
+                # Smooth: slowly track target (grow faster than shrink)
+                if target_ymax > self._smooth_ymax:
+                    alpha = YAXIS_SMOOTH_FACTOR * 3  # Grow faster
+                else:
+                    alpha = YAXIS_SMOOTH_FACTOR  # Shrink slowly
+                self._smooth_ymax += alpha * (target_ymax - self._smooth_ymax)
+                self.spectrum_plot.setYRange(0, self._smooth_ymax)
+                # Update spinbox to reflect current auto value (without triggering signal)
+                self.ymax_spin.blockSignals(True)
+                self.ymax_spin.setValue(self._smooth_ymax)
+                self.ymax_spin.blockSignals(False)
     
     def _export_csv(self):
         """Export onset data to CSV."""
