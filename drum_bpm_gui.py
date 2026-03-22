@@ -333,7 +333,6 @@ class AudioProcessor:
             current_energy = np.max(envelope)
             samples_since_last = self.total_samples_processed - self.last_onset_sample
             
-            self.last_onset_detected = False
             if current_energy > threshold and samples_since_last > self.refractory_samples:
                 # Onset detected!
                 self.last_onset_detected = True
@@ -1034,6 +1033,7 @@ class DrumBPMWindow(QMainWindow):
         
         # Update onset indicator (flash green on hit)
         if self.processor.last_onset_detected:
+            self.processor.last_onset_detected = False  # Consume the flag
             self.onset_indicator.setStyleSheet("color: #4CAF50;")  # Green
             self.onset_flash_counter = 3  # Flash for 3 frames
         elif self.onset_flash_counter > 0:
