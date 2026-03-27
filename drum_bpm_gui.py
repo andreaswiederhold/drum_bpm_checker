@@ -861,7 +861,11 @@ class DrumBPMWindow(QMainWindow):
         self.consistency_plot.setLabel('bottom', 'Hit Frequency (Hz)')
         self.consistency_plot.setBackground('#1e1e1e')
         self.consistency_plot.setMaximumHeight(120)
-        self.consistency_plot.hideAxis('left')
+        # Keep left axis visible but blank so x-axis aligns with spectrum plot
+        left_axis = self.consistency_plot.getAxis('left')
+        left_axis.setTicks([])
+        left_axis.setStyle(showValues=False)
+        left_axis.setWidth(self.spectrum_plot.getAxis('left').width())
         self.consistency_plot.showGrid(x=True, alpha=0.3)
         self.consistency_plot.getAxis('bottom').setTickSpacing(major=0.5, minor=0.1)
         
@@ -1184,8 +1188,8 @@ class DrumBPMWindow(QMainWindow):
             # Dynamic Y-axis with smoothing
             current_min = np.min(t_hz)
             current_max = np.max(t_hz)
-            # Add 10% headroom
-            margin = max((current_max - current_min) * 0.15, 0.1)
+            # Add 5% headroom
+            margin = max((current_max - current_min) * 0.05, 0.05)
             target_ymin = current_min - margin
             target_ymax = current_max + margin
             
