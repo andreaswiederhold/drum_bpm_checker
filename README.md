@@ -19,6 +19,9 @@ A real-time drum hit detection and BPM display application for Windows, designed
 - 🎯 **Tapping consistency heatmap** - color-coded normal distribution visualization
   - Green = high density (consistent), Red = low density (inconsistent)
   - Shows mean, standard deviation, and coefficient of variation
+- 📉 **Hit frequency timeline** showing recent per-hit frequency over time
+  - Default view shows the last 20 seconds
+  - Uses smoothed Hz values derived from recent inter-onset intervals
 - 📟 **Hz display** alongside BPM for frequency-based tempo reading
 - ⏰ **Auto-reset** of BPM display after 2 seconds of silence
 - ⚙️ **Adjustable parameters**: sensitivity, refractory period, high-pass filter, analysis window
@@ -28,23 +31,31 @@ A real-time drum hit detection and BPM display application for Windows, designed
 ## Screenshots
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  Controls: [Device ▼] [44100 Hz ▼] [Sens ━━●━]      │
-│  [Min Interval ━●━] [HP ☑] [Analysis 10s] [Start]    │
-├─────────────────────────────────────────────────────────────┤
-│            127.5  BPM    2.13  Hz    ●              │
-├─────────────────────────────────────────────────────────────┤
-│  Waveform                                           │
-│  ▁▂▃▅█▅▃▂▁▁▁▁▁▁▂▃▅█▅▃▂▁▁▁▁▁▁▂▃▅█▅▃▂▁▁▁▁▁             │
-├─────────────────────────────────────────────────────────────┤
-│  Rhythm Frequency Analysis (last 10s)                │
-│  ▅▃▂▁▁▁▁█▁▁▁▁  ┆ 2.13 Hz (128 BPM)               │
-│  0.5Hz             ┆                      10.0Hz    │
-├─────────────────────────────────────────────────────────────┤
-│  Tapping Consistency                                 │
-│  🟥🟥🟧🟨🟩🟩🟩┃🟩🟩🟩🟨🟧🟥🟥                         │
-│  μ=2.13 Hz (128 BPM) | σ=0.05 Hz | CV: 2.3%         │
-└─────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────────┐
+│ Controls: [Device ▼] [44100 Hz ▼] [Sens ━━●━] [Min Interval ━●━] [HP ☑]    │
+│           [Analysis 10s] [Start] [Export CSV]                              │
+├────────────────────────────────────────────────────────────────────────────┤
+│                         127.5 BPM    2.13 Hz    ●                          │
+├────────────────────────────────────────────────────────────────────────────┤
+│ Waveform                                                                   │
+│ ▁▂▃▅█▅▃▂▁▁▁▁▁▁▂▃▅█▅▃▂▁▁▁▁▁▁▂▃▅█▅▃▂▁▁▁▁▁                           │
+├────────────────────────────────────────────────────────────────────────────┤
+│ Rhythm Frequency Analysis (last 10s)                                       │
+│ X: 0.0-10.0 Hz   Y: Auto   Peak: 2.13 Hz (128 BPM)                         │
+│ ▁▁▁▂▃▄▅▇█▇▅▄▃▂▁▁▁▁▁▁▁▁▁▁                                              │
+├────────────────────────────────────────────────────────────────────────────┤
+│ Tapping Consistency                                                        │
+│                                                                            │
+│🟥🟥🟧🟨🟩🟩🟩┃🟩🟩🟩🟨🟧🟥🟥                                        │
+│ μ=2.13 Hz (128 BPM) | σ=0.05 Hz | CV: 2.3% | Samples: 18                   │
+├────────────────────────────────────────────────────────────────────────────┤
+│ Hit Frequency Timeline                                                     │
+│ Show last: 20 s                                                            │
+│ 2.3 ┤                           ••─•                                       │
+│ 2.1 ┤                    •─•──•                                            │
+│ 1.9 ┤              •─•─•                                                   │
+│     └─────────────────────────────────────────────────────── -20s ──── 0s  │
+└────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Requirements
@@ -60,7 +71,7 @@ A real-time drum hit detection and BPM display application for Windows, designed
 
 ```powershell
 git clone <repository-url>
-cd bpm_checker
+cd drum_bpm_checker
 ```
 
 ### 2. Create a virtual environment (recommended)
@@ -127,8 +138,17 @@ A color-coded heatmap showing how consistent your tapping is:
 - **Green** = high density (you hit close to your mean tempo)
 - **Red** = low density (hits are spread out / inconsistent)
 - **White dashed line** = mean hit frequency (μ)
+- Uses the same **X Min/X Max** range as the rhythm frequency analysis plot
 - **Info line** = Mean Hz/BPM, Standard Deviation, Coefficient of Variation (CV%), sample count
 - Lower CV% = more consistent timing
+
+### Hit Frequency Timeline (4th Plot)
+
+The lower plot shows how your hit frequency changes over recent time:
+- Uses smoothed Hz values based on recent inter-onset intervals, so it tracks the main Hz display more closely than raw per-hit values
+- Default range shows the **last 20 seconds**
+- X-axis runs from negative time to `0`, where `0` is the current moment
+- Y-axis auto-scales with light padding around the observed values
 
 ## Calibration Tips
 
@@ -194,6 +214,7 @@ A color-coded heatmap showing how consistent your tapping is:
 6. **BPM Calculation**: Median of inter-onset intervals, IQR outlier rejection
 7. **Rhythm Spectrum**: FFT of onset impulse train over configurable analysis window (2-30s)
 8. **Consistency Analysis**: Normal distribution fitted to inter-onset interval frequencies (Hz), displayed as a green-to-red heatmap
+9. **Hit Frequency Timeline**: Rolling median of recent hit-frequency estimates with dynamic Y-axis scaling
 
 ### Performance
 
