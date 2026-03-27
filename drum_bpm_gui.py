@@ -76,7 +76,7 @@ MIN_BPM = 30
 MAX_BPM = 600
 DEFAULT_ANALYSIS_WINDOW = 10.0  # Seconds of onset history for rhythm analysis
 IMPULSE_SAMPLE_RATE = 100  # Hz - sample rate for onset impulse train
-DEFAULT_RHYTHM_FREQ_MIN = 0.5  # Hz (30 BPM)
+DEFAULT_RHYTHM_FREQ_MIN = 0.0  # Hz (0 BPM)
 DEFAULT_RHYTHM_FREQ_MAX = 10.0  # Hz (600 BPM)
 DEFAULT_MAGNITUDE_MIN = 0.0  # Y-axis min for rhythm spectrum
 DEFAULT_MAGNITUDE_MAX = 0.05  # Y-axis max for rhythm spectrum
@@ -84,7 +84,7 @@ BPM_RESET_TIMEOUT = 2.0  # Seconds without onset before resetting BPM display
 YAXIS_SMOOTH_FACTOR = 0.05  # Exponential smoothing for dynamic Y-axis (lower = smoother)
 CONSISTENCY_RESOLUTION = 200  # Number of bins for consistency heatmap
 CONSISTENCY_SIGMA_RANGE = 4  # How many std devs to show around mean
-DEFAULT_TIMELINE_WINDOW = 30  # Seconds of Hz timeline to show
+DEFAULT_TIMELINE_WINDOW = 20  # Seconds of Hz timeline to show
 
 
 # -----------------------------------------------------------------------------
@@ -461,6 +461,7 @@ class AudioProcessor:
     def get_hz_timeline(self, window_seconds):
         """
         Get timestamped Hz values for the timeline plot.
+        Uses rolling median with IQR outlier rejection (matching upper BPM/Hz display).
         Returns (relative_times, hz_values) where relative_times are seconds ago (negative).
         """
         with self._rhythm_lock:
@@ -471,16 +472,48 @@ class AudioProcessor:
         now = time.time()
         cutoff = now - window_seconds
         
-        # Compute Hz between consecutive onsets
-        rel_times = []
-        hz_vals = []
+        # Compute raw Hz between consecutive onsets
+        all_rel_times = []
+        all_hz = []
         for i in range(1, len(times)):
             ioi = times[i] - times[i - 1]
-            if ioi > 0 and times[i] >= cutoff:
-                rel_times.append(times[i] - now)  # Negative values (seconds ago)
-                hz_vals.append(1.0 / ioi)
+            if ioi > 0:
+                all_rel_times.append(times[i] - now)
+                all_hz.append(1.0 / ioi)
         
-        return np.array(rel_times), np.array(hz_vals)
+        if len(all_hz) < 2:
+            return np.array([]), np.array([])
+        
+        # Apply rolling median with IQR outlier rejection (window of ~BPM_HISTORY_LENGTH)
+        window = min(BPM_HISTORY_LENGTH, len(all_hz))
+        half_w = window // 2
+        smoothed_times = []
+        smoothed_hz = []
+        
+        for i in range(len(all_hz)):
+            # Only include points within the display window
+            if all_rel_times[i] < -window_seconds:
+                continue
+            
+            lo = max(0, i - half_w)
+            hi = min(len(all_hz), i + half_w + 1)
+            local = np.array(all_hz[lo:hi])
+            
+            # IQR outlier rejection (same as _update_bpm)
+            if len(local) >= 4:
+                q1 = np.percentile(local, 25)
+                q3 = np.percentile(local, 75)
+                iqr = q3 - q1
+                valid = local[(local >= q1 - 1.5 * iqr) & (local <= q3 + 1.5 * iqr)]
+                if len(valid) == 0:
+                    valid = local
+            else:
+                valid = local
+            
+            smoothed_times.append(all_rel_times[i])
+            smoothed_hz.append(float(np.median(valid)))
+        
+        return np.array(smoothed_times), np.array(smoothed_hz)
     
     def start(self):
         """Start audio capture and processing."""
@@ -745,7 +778,7 @@ class DrumBPMWindow(QMainWindow):
         range_layout = QHBoxLayout()
         range_layout.addWidget(QLabel("X Min (Hz):"))
         self.xmin_spin = QDoubleSpinBox()
-        self.xmin_spin.setRange(0.1, 10.0)
+        self.xmin_spin.setRange(0.0, 10.0)
         self.xmin_spin.setValue(DEFAULT_RHYTHM_FREQ_MIN)
         self.xmin_spin.setSingleStep(0.1)
         self.xmin_spin.setDecimals(1)
@@ -928,7 +961,7 @@ class DrumBPMWindow(QMainWindow):
             self.processor.set_analysis_window(value)
     
     def _on_xrange_changed(self):
-        """Handle X-axis range change for rhythm spectrum."""
+        """Handle X-axis range change for rhythm spectrum and consistency plot."""
         xmin = self.xmin_spin.value()
         xmax = self.xmax_spin.value()
         # Ensure min < max
@@ -936,6 +969,7 @@ class DrumBPMWindow(QMainWindow):
             xmax = xmin + 0.5
             self.xmax_spin.setValue(xmax)
         self.spectrum_plot.setXRange(xmin, xmax)
+        self.consistency_plot.setXRange(xmin, xmax)
         # Update BPM equivalent label
         self.bpm_range_label.setText(f"({int(xmin*60)}-{int(xmax*60)} BPM)")
     
@@ -1096,10 +1130,9 @@ class DrumBPMWindow(QMainWindow):
             mean_hz, std_hz, hz_values = stats
             std_hz = max(std_hz, 0.01)  # Prevent zero std
             
-            # Build x range centered on mean
-            display_range = max(std_hz * CONSISTENCY_SIGMA_RANGE, 0.5)
-            x_start = mean_hz - display_range
-            x_end = mean_hz + display_range
+            # Use same x range as frequency analysis plot
+            x_start = self.xmin_spin.value()
+            x_end = self.xmax_spin.value()
             x = np.linspace(x_start, x_end, CONSISTENCY_RESOLUTION)
             bar_width = (x_end - x_start) / CONSISTENCY_RESOLUTION
             
@@ -1124,6 +1157,8 @@ class DrumBPMWindow(QMainWindow):
             self.consistency_plot.addItem(self.consistency_bars)
             self.consistency_plot.setXRange(x_start, x_end)
             self.consistency_plot.setYRange(0, 1)
+            # Sync tick spacing with spectrum plot
+            self.consistency_plot.getAxis('bottom').setTickSpacing(major=0.5, minor=0.1)
             
             # Mean marker
             self.mean_line.setValue(mean_hz)
